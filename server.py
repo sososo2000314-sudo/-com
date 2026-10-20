@@ -1,348 +1,1091 @@
 
-#!/usr/bin/env python3
-"""Japan Connect - starter server. Uses DATABASE_URL (PostgreSQL) when configured."""
 import hashlib
 import hmac
 import json
+import logging
 import os
-import re
 import secrets
 import sqlite3
 import time
-import mimetypes
-from datetime import datetime, timezone
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import unquote, urlparse
 
-ROOT = Path(__file__).resolve().parent
-DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
-PORT = int(os.environ.get('PORT', '10000'))
-MAX_BODY = 2 * 1024 * 1024
+# =========================================================
+# Japan Connect 🇯🇵 - サーバー本体
+# =========================================================
 
-try:
-    import psycopg
-    from psycopg.rows import dict_row
-except Exception:
-    psycopg = None
-    dict_row = None
+BASE_DIR = Path(__file__).resolve().parent
+PORT = int(os.environ.get("PORT", "10000"))
+
+DATABASE_URL = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("NEON_DATABASE_URL")
+    or ""
+).strip()
+
+DB_PATH = os.environ.get(
+    "DB_PATH",
+    str(BASE_DIR / "japan_connect.db")
+)
+
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+
+PASSWORD_ITERATIONS = 310_000
+MAX_BODY_SIZE = 5 * 1024 * 1024
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+if DATABASE_URL:
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as exc:
+        raise RuntimeError(
+            "DATABASE_URL が設定されていますが、"
+            "psycopg がインストールされていません。"
+        ) from exc
 
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def clean_text(value, limit=10000):
-    if value is None:
-        return ''
-    return str(value).strip()[:limit]
+def json_bytes(data):
+    return json.dumps(
+        data,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def password_hash(password, salt):
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        PASSWORD_ITERATIONS,
+    ).hex()
 
 
 def make_password(password):
-    salt = secrets.token_bytes(16)
-    rounds = 310000
-    digest = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, rounds)
-    return f'pbkdf2_sha256${rounds}${salt.hex()}${digest.hex()}'
+    salt = secrets.token_hex(16)
+    return salt, password_hash(password, salt)
 
 
-def check_password(password, stored):
+def check_password(password, salt, stored_hash):
     try:
-        _, rounds, salt_hex, digest_hex = stored.split('$', 3)
-        actual = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt_hex), int(rounds)).hex()
-        return hmac.compare_digest(actual, digest_hex)
-    except Exception:
+        return hmac.compare_digest(
+            password_hash(password, salt),
+            stored_hash,
+        )
+    except (TypeError, ValueError):
         return False
 
 
-class DB:
-    def __init__(self):
-        self.pg = bool(DATABASE_URL and psycopg)
-        if DATABASE_URL and not psycopg:
-            print('WARNING: DATABASE_URL is set but psycopg is unavailable; using local SQLite.', flush=True)
-        self.sqlite_path = os.environ.get('SQLITE_PATH', str(ROOT / 'japan_connect.db'))
-        self.init_schema()
-
-    def connect(self):
-        if self.pg:
-            return psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=False)
-        conn = sqlite3.connect(self.sqlite_path, timeout=20)
-        conn.row_factory = sqlite3.Row
-        conn.execute('PRAGMA foreign_keys=ON')
-        return conn
-
-    def execute(self, conn, sql, params=()):
-        if self.pg:
-            sql = sql.replace('?', '%s')
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            return cur
-        return conn.execute(sql, params)
-
-    def init_schema(self):
-        conn = self.connect()
+@contextmanager
+def db_connection():
+    """SQLite または PostgreSQL への接続を管理する。"""
+    if DATABASE_URL:
+        conn = psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=15,
+        )
         try:
-            if self.pg:
-                statements = [
-                    "CREATE TABLE IF NOT EXISTS users (id BIGSERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL, created_at TEXT NOT NULL)",
-                    "CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL)",
-                    "CREATE TABLE IF NOT EXISTS posts (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)",
-                    "CREATE TABLE IF NOT EXISTS likes (user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE, created_at TEXT NOT NULL, PRIMARY KEY(user_id,post_id))",
-                    "CREATE TABLE IF NOT EXISTS comments (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE, body TEXT NOT NULL, created_at TEXT NOT NULL)",
-                    "CREATE TABLE IF NOT EXISTS messages (id BIGSERIAL PRIMARY KEY, from_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, to_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, subject TEXT NOT NULL DEFAULT '', body TEXT NOT NULL, is_read INTEGER NOT NULL DEFAULT 0, deleted_by_sender INTEGER NOT NULL DEFAULT 0, deleted_by_recipient INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)"
-                ]
-            else:
-                statements = [
-                    "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL, created_at TEXT NOT NULL)",
-                    "CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL)",
-                    "CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)",
-                    "CREATE TABLE IF NOT EXISTS likes (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, created_at TEXT NOT NULL, PRIMARY KEY(user_id,post_id))",
-                    "CREATE TABLE IF NOT EXISTS comments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, body TEXT NOT NULL, created_at TEXT NOT NULL)",
-                    "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, to_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, subject TEXT NOT NULL DEFAULT '', body TEXT NOT NULL, is_read INTEGER NOT NULL DEFAULT 0, deleted_by_sender INTEGER NOT NULL DEFAULT 0, deleted_by_recipient INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)"
-                ]
-            for statement in statements:
-                self.execute(conn, statement)
+            yield conn
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    else:
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
-DBH = DB()
+
+def execute(conn, sql, params=()):
+    """両方のデータベースで ? プレースホルダーを使えるようにする。"""
+    if DATABASE_URL:
+        sql = sql.replace("?", "%s")
+    return conn.execute(sql, params)
 
 
-def rowdict(row):
-    return dict(row) if row is not None else None
+def row_dict(row):
+    if row is None:
+        return None
+    return dict(row)
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = 'JapanConnect/1.0'
+def init_database():
+    """必要なテーブルを作成する。既存テーブルは削除しない。"""
+    if DATABASE_URL:
+        id_type = "BIGSERIAL PRIMARY KEY"
+        bool_type = "BOOLEAN NOT NULL DEFAULT FALSE"
+    else:
+        id_type = "INTEGER PRIMARY KEY AUTOINCREMENT"
+        bool_type = "BOOLEAN NOT NULL DEFAULT 0"
+
+    statements = [
+        f"""
+        CREATE TABLE IF NOT EXISTS users (
+            id {id_type},
+            username TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            is_admin {bool_type},
+            created_at TEXT NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS posts (
+            id {id_type},
+            user_id BIGINT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS likes (
+            user_id BIGINT NOT NULL,
+            post_id BIGINT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, post_id)
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS comments (
+            id {id_type},
+            post_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS messages (
+            id {id_type},
+            sender_id BIGINT NOT NULL,
+            receiver_id BIGINT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """,
+    ]
+
+    with db_connection() as conn:
+        for statement in statements:
+            conn.execute(statement)
+
+        # 以前からあるデータベースにも管理者列を追加する。
+        if DATABASE_URL:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "is_admin BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        else:
+            columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(users)"
+                ).fetchall()
+            }
+            if "is_admin" not in columns:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN "
+                    "is_admin BOOLEAN NOT NULL DEFAULT 0"
+                )
+
+        # よく使用する検索用インデックス。
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_posts_created "
+            "ON posts(created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_users "
+            "ON messages(sender_id, receiver_id, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_comments_post "
+            "ON comments(post_id, created_at)"
+        )
+
+    ensure_admin()
+    logging.info(
+        "データベースの初期化が完了しました。接続先=%s",
+        "PostgreSQL" if DATABASE_URL else "SQLite",
+    )
+
+
+def ensure_admin():
+    """環境変数で指定された管理者アカウントを用意する。"""
+    if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+        logging.warning(
+            "ADMIN_USERNAME または ADMIN_PASSWORD が未設定です。"
+            "管理者アカウントの自動作成は行いません。"
+        )
+        return
+
+    if len(ADMIN_PASSWORD) < 12:
+        logging.warning(
+            "管理者パスワードは12文字以上にしてください。"
+        )
+        return
+
+    salt, hashed = make_password(ADMIN_PASSWORD)
+
+    with db_connection() as conn:
+        existing = execute(
+            conn,
+            "SELECT id FROM users WHERE username = ?",
+            (ADMIN_USERNAME,),
+        ).fetchone()
+
+        if existing:
+            # 既存アカウントを管理者にする。
+            execute(
+                conn,
+                "UPDATE users SET is_admin = TRUE WHERE username = ?",
+                (ADMIN_USERNAME,),
+            )
+        else:
+            execute(
+                conn,
+                """
+                INSERT INTO users
+                    (username, display_name, password_hash,
+                     salt, is_admin, created_at)
+                VALUES (?, ?, ?, ?, TRUE, ?)
+                """,
+                (
+                    ADMIN_USERNAME,
+                    ADMIN_USERNAME,
+                    hashed,
+                    salt,
+                    now(),
+                ),
+            )
+
+    logging.info("管理者アカウントの確認が完了しました。")
+
+
+def public_user(user):
+    if not user:
+        return None
+
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "display_name": user["display_name"],
+        "is_admin": bool(user["is_admin"]),
+        "created_at": user["created_at"],
+    }
+
+
+def get_user_by_token(conn, token):
+    if not token:
+        return None
+
+    row = execute(
+        conn,
+        """
+        SELECT users.*
+        FROM sessions
+        JOIN users ON users.id = sessions.user_id
+        WHERE sessions.token = ?
+        """,
+        (token,),
+    ).fetchone()
+
+    return row_dict(row)
+
+
+def get_token(handler):
+    header = handler.headers.get("Authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+
+    # Cookie 認証は必須にしない。
+    return ""
+
+
+def require_user(handler, conn):
+    user = get_user_by_token(conn, get_token(handler))
+    if not user:
+        raise ApiError(401, "ログインしてください。")
+    return user
+
+
+def require_admin(handler, conn):
+    user = require_user(handler, conn)
+    if not bool(user["is_admin"]):
+        raise ApiError(403, "管理者のみ実行できます。")
+    return user
+
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def parse_json_body(handler):
+    length = int(handler.headers.get("Content-Length", "0") or "0")
+
+    if length < 0 or length > MAX_BODY_SIZE:
+        raise ApiError(413, "送信データが大きすぎます。")
+
+    raw = handler.rfile.read(length)
+
+    if not raw:
+        return {}
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ApiError(400, "送信データの形式が正しくありません。")
+
+    if not isinstance(data, dict):
+        raise ApiError(400, "送信データはJSONオブジェクトにしてください。")
+
+    return data
+
+
+def clean_text(value, max_length=5000):
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:max_length]
+
+
+class JapanConnectHandler(BaseHTTPRequestHandler):
+    server_version = "JapanConnect/1.0"
 
     def log_message(self, fmt, *args):
-        print('%s - %s' % (self.address_string(), fmt % args), flush=True)
+        logging.info(
+            "%s - %s",
+            self.client_address[0],
+            fmt % args,
+        )
 
-    def send_json(self, status, payload):
-        data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    def send_json(self, status, data):
+        body = json_bytes(data)
         self.send_response(status)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', str(len(data)))
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(body)
 
-    def read_json(self):
-        try:
-            size = int(self.headers.get('Content-Length', '0'))
-        except ValueError:
-            raise ValueError('リクエストサイズが不正です')
-        if size > MAX_BODY:
-            raise OverflowError('送信データが大きすぎます')
-        raw = self.rfile.read(size) if size else b'{}'
-        try:
-            data = json.loads(raw.decode('utf-8'))
-            if not isinstance(data, dict):
-                raise ValueError()
-            return data
-        except Exception:
-            raise ValueError('送信データの形式が正しくありません')
+    def send_error_json(self, status, message):
+        self.send_json(status, {
+            "ok": False,
+            "error": message,
+            "message": message,
+        })
 
-    def db(self):
-        return DBH.connect()
-
-    def query(self, conn, sql, params=()):
-        return DBH.execute(conn, sql, params)
-
-    def current_user(self, conn):
-        auth = self.headers.get('Authorization', '')
-        token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
-        if not token:
-            return None
-        row = self.query(conn, 'SELECT u.id,u.username,u.display_name,u.created_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?', (token,)).fetchone()
-        return rowdict(row)
-
-    def require_user(self, conn):
-        user = self.current_user(conn)
-        if not user:
-            self.send_json(401, {'error':'ログインしてください'})
-            return None
-        return user
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Allow", "GET, POST, DELETE, OPTIONS")
+        self.end_headers()
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = unquote(parsed.path)
-        if path.startswith('/api/'):
-            self.api_get(path, parse_qs(parsed.query))
-        else:
-            self.static_get(path)
+        try:
+            path = urlparse(self.path).path.rstrip("/") or "/"
+
+            if path.startswith("/api/"):
+                self.api_get(path)
+            else:
+                self.serve_static(path)
+
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.message)
+        except Exception:
+            logging.exception("GET処理でエラーが発生しました")
+            self.send_error_json(
+                500,
+                "サーバー内部でエラーが発生しました。ログを確認してください。",
+            )
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        if not path.startswith('/api/'):
-            self.send_json(404, {'error':'ページが見つかりません'}); return
-        self.api_post(path)
+        try:
+            path = urlparse(self.path).path.rstrip("/")
+            data = parse_json_body(self)
 
-    def do_PATCH(self):
-        path = urlparse(self.path).path
-        if path != '/api/me':
-            self.send_json(404, {'error':'ページが見つかりません'}); return
-        self.api_patch_me()
+            if not path.startswith("/api/"):
+                raise ApiError(404, "このAPIは存在しません。")
+
+            self.api_post(path, data)
+
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.message)
+        except Exception:
+            logging.exception("POST処理でエラーが発生しました")
+            self.send_error_json(
+                500,
+                "サーバー内部でエラーが発生しました。ログを確認してください。",
+            )
 
     def do_DELETE(self):
-        path = urlparse(self.path).path
-        if path.startswith('/api/'):
+        try:
+            path = urlparse(self.path).path.rstrip("/")
+            if not path.startswith("/api/"):
+                raise ApiError(404, "このAPIは存在しません。")
             self.api_delete(path)
-        else:
-            self.send_json(404, {'error':'ページが見つかりません'})
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.message)
+        except Exception:
+            logging.exception("DELETE処理でエラーが発生しました")
+            self.send_error_json(500, "削除処理に失敗しました。")
 
-    def static_get(self, path):
-        if path == '/': path = '/index.html'
-        mapping = {'/index.html': ROOT / 'index.html', '/style.css': ROOT / 'style.css', '/app.js': ROOT / 'app.js'}
-        file_path = mapping.get(path)
-        if not file_path or not file_path.is_file():
-            self.send_error(404, 'Not Found'); return
-        content = file_path.read_bytes()
-        ctype = mimetypes.guess_type(str(file_path))[0] or 'application/octet-stream'
-        if ctype.startswith('text/') or ctype in ('application/javascript',): ctype += '; charset=utf-8'
-        self.send_response(200); self.send_header('Content-Type', ctype); self.send_header('Content-Length', str(len(content))); self.send_header('X-Content-Type-Options','nosniff'); self.end_headers(); self.wfile.write(content)
-
-    def api_get(self, path, query):
-        conn = self.db()
-        try:
-            if path == '/api/me':
-                user = self.require_user(conn)
-                if user: self.send_json(200, {'user':user})
+    def api_get(self, path):
+        with db_connection() as conn:
+            if path == "/api/health":
+                self.send_json(200, {
+                    "ok": True,
+                    "database": (
+                        "postgresql" if DATABASE_URL else "sqlite"
+                    ),
+                })
                 return
-            if path == '/api/posts':
-                user = self.require_user(conn)
-                if not user: return
-                rows = self.query(conn, "SELECT p.id,p.user_id,p.kind,p.title,p.body,p.url,p.created_at,u.username,u.display_name,(SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id) AS likes_count,(SELECT COUNT(*) FROM comments c WHERE c.post_id=p.id) AS comments_count,EXISTS(SELECT 1 FROM likes l2 WHERE l2.post_id=p.id AND l2.user_id=?) AS liked_by_me FROM posts p JOIN users u ON u.id=p.user_id ORDER BY p.id DESC LIMIT 300", (user['id'],)).fetchall()
-                self.send_json(200, {'posts':[rowdict(r) for r in rows]}); return
-            if path == '/api/users':
-                user = self.require_user(conn)
-                if not user: return
-                q = clean_text((query.get('q') or [''])[0], 80).lower()
-                rows = self.query(conn, "SELECT username,display_name,created_at FROM users WHERE lower(username) LIKE ? OR lower(display_name) LIKE ? ORDER BY username LIMIT 50", (f'%{q}%',f'%{q}%')).fetchall()
-                self.send_json(200, {'users':[rowdict(r) for r in rows if r['username'] != user['username']]}); return
-            if path == '/api/mail':
-                user = self.require_user(conn)
-                if not user: return
-                box = (query.get('box') or ['inbox'])[0]
-                if box == 'sent':
-                    rows = self.query(conn, "SELECT m.id,m.subject,m.body,m.is_read,m.created_at,u.username AS to_username,(SELECT username FROM users WHERE id=m.from_user_id) AS from_username FROM messages m JOIN users u ON u.id=m.to_user_id WHERE m.from_user_id=? AND m.deleted_by_sender=0 ORDER BY m.id DESC LIMIT 300", (user['id'],)).fetchall()
-                else:
-                    rows = self.query(conn, "SELECT m.id,m.subject,m.body,m.is_read,m.created_at,u.username AS from_username,(SELECT username FROM users WHERE id=m.to_user_id) AS to_username FROM messages m JOIN users u ON u.id=m.from_user_id WHERE m.to_user_id=? AND m.deleted_by_recipient=0 ORDER BY m.id DESC LIMIT 300", (user['id'],)).fetchall()
-                self.send_json(200, {'messages':[rowdict(r) for r in rows]}); return
-            self.send_json(404, {'error':'APIが見つかりません'})
-        except Exception as e:
-            conn.rollback(); print('GET API error:', repr(e), flush=True); self.send_json(500, {'error':'サーバーでエラーが発生しました'})
-        finally:
-            conn.close()
 
-    def api_post(self, path):
-        try: data = self.read_json()
-        except OverflowError as e: self.send_json(413, {'error':str(e)}); return
-        except ValueError as e: self.send_json(400, {'error':str(e)}); return
-        conn = self.db()
-        try:
-            if path == '/api/register':
-                username = clean_text(data.get('username'),32)
-                display = clean_text(data.get('display_name') or username,40)
-                password = str(data.get('password') or '')
-                if not re.fullmatch(r'[A-Za-z0-9_.-]{3,32}', username): self.send_json(400, {'error':'アカウント名は英数字、_、-、. の3〜32文字にしてください'}); return
-                if len(password) < 8: self.send_json(400, {'error':'パスワードは8文字以上にしてください'}); return
+            if path == "/api/me":
+                user = get_user_by_token(conn, get_token(self))
+                self.send_json(200, {
+                    "ok": True,
+                    "user": public_user(user),
+                })
+                return
+
+            if path == "/api/posts":
+                rows = execute(
+                    conn,
+                    """
+                    SELECT posts.*, users.username,
+                           users.display_name
+                    FROM posts
+                    JOIN users ON users.id = posts.user_id
+                    ORDER BY posts.id DESC
+                    LIMIT 200
+                    """,
+                ).fetchall()
+
+                user = get_user_by_token(conn, get_token(self))
+                current_id = user["id"] if user else None
+
+                result = []
+                for row in rows:
+                    post = row_dict(row)
+                    likes = execute(
+                        conn,
+                        "SELECT COUNT(*) AS n FROM likes WHERE post_id = ?",
+                        (post["id"],),
+                    ).fetchone()
+                    comments = execute(
+                        conn,
+                        """
+                        SELECT comments.id, comments.content,
+                               comments.created_at, users.username,
+                               users.display_name
+                        FROM comments
+                        JOIN users ON users.id = comments.user_id
+                        WHERE comments.post_id = ?
+                        ORDER BY comments.id ASC
+                        LIMIT 100
+                        """,
+                        (post["id"],),
+                    ).fetchall()
+
+                    liked = False
+                    if current_id is not None:
+                        liked = execute(
+                            conn,
+                            "SELECT 1 FROM likes "
+                            "WHERE user_id = ? AND post_id = ?",
+                            (current_id, post["id"]),
+                        ).fetchone() is not None
+
+                    result.append({
+                        "id": post["id"],
+                        "user_id": post["user_id"],
+                        "username": post["username"],
+                        "display_name": post["display_name"],
+                        "content": post["content"],
+                        "created_at": post["created_at"],
+                        "likes": likes["n"],
+                        "liked": liked,
+                        "comments": [row_dict(c) for c in comments],
+                    })
+
+                self.send_json(200, {"ok": True, "posts": result})
+                return
+
+            if path == "/api/mail":
+                user = require_user(self, conn)
+                rows = execute(
+                    conn,
+                    """
+                    SELECT messages.*, 
+                           sender.username AS sender_username,
+                           sender.display_name AS sender_name,
+                           receiver.username AS receiver_username,
+                           receiver.display_name AS receiver_name
+                    FROM messages
+                    JOIN users AS sender ON sender.id = messages.sender_id
+                    JOIN users AS receiver ON receiver.id = messages.receiver_id
+                    WHERE messages.sender_id = ?
+                       OR messages.receiver_id = ?
+                    ORDER BY messages.id DESC
+                    LIMIT 300
+                    """,
+                    (user["id"], user["id"]),
+                ).fetchall()
+
+                self.send_json(200, {
+                    "ok": True,
+                    "messages": [row_dict(r) for r in rows],
+                })
+                return
+
+            if path == "/api/friends":
+                user = require_user(self, conn)
+                rows = execute(
+                    conn,
+                    """
+                    SELECT id, username, display_name, created_at
+                    FROM users
+                    WHERE id != ?
+                    ORDER BY username
+                    LIMIT 500
+                    """,
+                    (user["id"],),
+                ).fetchall()
+                self.send_json(200, {
+                    "ok": True,
+                    "friends": [row_dict(r) for r in rows],
+                })
+                return
+
+            if path == "/api/admin/users":
+                require_admin(self, conn)
+                rows = execute(
+                    conn,
+                    """
+                    SELECT id, username, display_name, is_admin, created_at
+                    FROM users ORDER BY id DESC LIMIT 1000
+                    """,
+                ).fetchall()
+                self.send_json(200, {
+                    "ok": True,
+                    "users": [public_user(row_dict(r)) for r in rows],
+                })
+                return
+
+            if path == "/api/admin/posts":
+                require_admin(self, conn)
+                rows = execute(
+                    conn,
+                    """
+                    SELECT posts.*, users.username, users.display_name
+                    FROM posts
+                    JOIN users ON users.id = posts.user_id
+                    ORDER BY posts.id DESC LIMIT 1000
+                    """,
+                ).fetchall()
+                self.send_json(200, {
+                    "ok": True,
+                    "posts": [row_dict(r) for r in rows],
+                })
+                return
+
+        raise ApiError(404, "指定されたAPIは存在しません。")
+
+    def api_post(self, path, data):
+        with db_connection() as conn:
+            if path == "/api/register":
+                username = clean_text(data.get("username"), 32)
+                password = data.get("password", "")
+                display_name = clean_text(
+                    data.get("display_name")
+                    or data.get("name")
+                    or username,
+                    60,
+                )
+
+                if not username or not password:
+                    raise ApiError(
+                        400,
+                        "アカウント名とパスワードを入力してください。",
+                    )
+                if len(username) < 3:
+                    raise ApiError(
+                        400,
+                        "アカウント名は3文字以上にしてください。",
+                    )
+                if not all(
+                    ch.isalnum() or ch in "_-." for ch in username
+                ):
+                    raise ApiError(
+                        400,
+                        "アカウント名には英数字、_、-、. を使用できます。",
+                    )
+                if len(password) < 8:
+                    raise ApiError(
+                        400,
+                        "パスワードは8文字以上にしてください。",
+                    )
+                if len(password) > 1024:
+                    raise ApiError(400, "パスワードが長すぎます。")
+
+                existing = execute(
+                    conn,
+                    "SELECT id FROM users WHERE username = ?",
+                    (username,),
+                ).fetchone()
+                if existing:
+                    raise ApiError(
+                        409,
+                        "このアカウント名はすでに使用されています。",
+                    )
+
+                salt, hashed = make_password(password)
+                cursor = execute(
+                    conn,
+                    """
+                    INSERT INTO users
+                        (username, display_name, password_hash,
+                         salt, is_admin, created_at)
+                    VALUES (?, ?, ?, ?, FALSE, ?)
+                    """,
+                    (username, display_name or username,
+                     hashed, salt, now()),
+                )
+
+                user_id = cursor.lastrowid
+                if DATABASE_URL:
+                    # PostgreSQLでは lastrowid を使わずIDを取得する。
+                    row = execute(
+                        conn,
+                        "SELECT id FROM users WHERE username = ?",
+                        (username,),
+                    ).fetchone()
+                    user_id = row["id"]
+
                 token = secrets.token_urlsafe(32)
-                try:
-                    cur = self.query(conn, 'INSERT INTO users(username,display_name,password_hash,created_at) VALUES(?,?,?,?) RETURNING id,username,display_name,created_at', (username,display,make_password(password),now_iso()))
-                    user = rowdict(cur.fetchone())
-                    self.query(conn, 'INSERT INTO sessions(token,user_id,created_at) VALUES(?,?,?)', (token,user['id'],now_iso()))
-                    conn.commit(); self.send_json(201, {'token':token,'user':user})
-                except Exception:
-                    conn.rollback(); self.send_json(409, {'error':'そのアカウント名はすでに使われています'})
+                execute(
+                    conn,
+                    "INSERT INTO sessions (token, user_id, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (token, user_id, now()),
+                )
+
+                user = execute(
+                    conn,
+                    "SELECT * FROM users WHERE id = ?",
+                    (user_id,),
+                ).fetchone()
+
+                logging.info("アカウント登録成功: %s", username)
+                self.send_json(201, {
+                    "ok": True,
+                    "message": "アカウントを作成しました。",
+                    "token": token,
+                    "user": public_user(row_dict(user)),
+                })
                 return
-            if path == '/api/login':
-                username = clean_text(data.get('username'),32); password = str(data.get('password') or '')
-                row = self.query(conn, 'SELECT id,username,display_name,password_hash,created_at FROM users WHERE lower(username)=lower(?)', (username,)).fetchone()
-                if not row or not check_password(password,row['password_hash']): self.send_json(401, {'error':'アカウント名またはパスワードが違います'}); return
-                token = secrets.token_urlsafe(32); self.query(conn,'INSERT INTO sessions(token,user_id,created_at) VALUES(?,?,?)',(token,row['id'],now_iso()));conn.commit()
-                self.send_json(200, {'token':token,'user':{'id':row['id'],'username':row['username'],'display_name':row['display_name'],'created_at':row['created_at']}}); return
-            user = self.require_user(conn)
-            if not user: return
-            if path == '/api/logout':
-                auth = self.headers.get('Authorization',''); token=auth[7:].strip() if auth.lower().startswith('bearer ') else ''
-                self.query(conn,'DELETE FROM sessions WHERE token=?',(token,));conn.commit();self.send_json(200,{'ok':True});return
-            if path == '/api/posts':
-                kind=clean_text(data.get('kind'),30); title=clean_text(data.get('title'),160); body=clean_text(data.get('body'),10000); url=clean_text(data.get('url'),2000)
-                if kind not in ('text','image','video_vertical','video_horizontal','file','url'): self.send_json(400,{'error':'投稿の種類が正しくありません'});return
-                if not title: self.send_json(400,{'error':'タイトルを入力してください'});return
-                if kind=='url' and url and not re.match(r'^https?://',url,re.I): self.send_json(400,{'error':'URLは http:// または https:// から始めてください'});return
-                cur=self.query(conn,'INSERT INTO posts(user_id,kind,title,body,url,created_at) VALUES(?,?,?,?,?,?) RETURNING id',(user['id'],kind,title,body,url,now_iso()));post_id=cur.fetchone()['id'];conn.commit();self.send_json(201,{'ok':True,'id':post_id});return
-            if path == '/api/mail':
-                to_username=clean_text(data.get('to_username'),32);subject=clean_text(data.get('subject'),160);body=clean_text(data.get('body'),10000)
-                if not body: self.send_json(400,{'error':'メッセージを入力してください'});return
-                target=self.query(conn,'SELECT id FROM users WHERE lower(username)=lower(?)',(to_username,)).fetchone()
-                if not target: self.send_json(404,{'error':'宛先アカウントが見つかりません'});return
-                if target['id']==user['id']: self.send_json(400,{'error':'自分自身には送信できません'});return
-                cur=self.query(conn,'INSERT INTO messages(from_user_id,to_user_id,subject,body,is_read,created_at) VALUES(?,?,?,?,0,?) RETURNING id',(user['id'],target['id'],subject,body,now_iso()));conn.commit();self.send_json(201,{'ok':True,'id':cur.fetchone()['id']});return
-            match=re.fullmatch(r'/api/posts/(\d+)/like',path)
-            if match:
-                post_id=int(match.group(1));exists=self.query(conn,'SELECT 1 FROM likes WHERE user_id=? AND post_id=?',(user['id'],post_id)).fetchone()
-                if exists:self.query(conn,'DELETE FROM likes WHERE user_id=? AND post_id=?',(user['id'],post_id))
+
+            if path == "/api/login":
+                username = clean_text(data.get("username"), 32)
+                password = data.get("password", "")
+
+                user = execute(
+                    conn,
+                    "SELECT * FROM users WHERE username = ?",
+                    (username,),
+                ).fetchone()
+
+                if (
+                    not user
+                    or not check_password(
+                        password,
+                        user["salt"],
+                        user["password_hash"],
+                    )
+                ):
+                    raise ApiError(
+                        401,
+                        "アカウント名またはパスワードが違います。",
+                    )
+
+                token = secrets.token_urlsafe(32)
+                execute(
+                    conn,
+                    "INSERT INTO sessions (token, user_id, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (token, user["id"], now()),
+                )
+                self.send_json(200, {
+                    "ok": True,
+                    "message": "ログインしました。",
+                    "token": token,
+                    "user": public_user(row_dict(user)),
+                })
+                return
+
+            if path == "/api/logout":
+                execute(
+                    conn,
+                    "DELETE FROM sessions WHERE token = ?",
+                    (get_token(self),),
+                )
+                self.send_json(200, {"ok": True})
+                return
+
+            if path == "/api/posts":
+                user = require_user(self, conn)
+                content = clean_text(data.get("content"), 10000)
+                if not content:
+                    raise ApiError(400, "投稿内容を入力してください。")
+
+                cursor = execute(
+                    conn,
+                    "INSERT INTO posts (user_id, content, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (user["id"], content, now()),
+                )
+                post_id = cursor.lastrowid
+
+                if DATABASE_URL:
+                    row = execute(
+                        conn,
+                        "SELECT id FROM posts WHERE user_id = ? "
+                        "AND content = ? ORDER BY id DESC LIMIT 1",
+                        (user["id"], content),
+                    ).fetchone()
+                    post_id = row["id"]
+
+                self.send_json(201, {
+                    "ok": True,
+                    "message": "投稿しました。",
+                    "id": post_id,
+                })
+                return
+
+            if path.startswith("/api/posts/") and path.endswith("/like"):
+                user = require_user(self, conn)
+                parts = path.strip("/").split("/")
+                try:
+                    post_id = int(parts[2])
+                except (IndexError, ValueError):
+                    raise ApiError(400, "投稿IDが正しくありません。")
+
+                post = execute(
+                    conn,
+                    "SELECT id FROM posts WHERE id = ?",
+                    (post_id,),
+                ).fetchone()
+                if not post:
+                    raise ApiError(404, "投稿が見つかりません。")
+
+                existing = execute(
+                    conn,
+                    "SELECT 1 FROM likes WHERE user_id = ? AND post_id = ?",
+                    (user["id"], post_id),
+                ).fetchone()
+
+                if existing:
+                    execute(
+                        conn,
+                        "DELETE FROM likes WHERE user_id = ? AND post_id = ?",
+                        (user["id"], post_id),
+                    )
+                    liked = False
                 else:
-                    try:self.query(conn,'INSERT INTO likes(user_id,post_id,created_at) VALUES(?,?,?)',(user['id'],post_id,now_iso()))
-                    except Exception:conn.rollback()
-                conn.commit();self.send_json(200,{'ok':True,'liked':not bool(exists)});return
-            match=re.fullmatch(r'/api/posts/(\d+)/comments',path)
-            if match:
-                body=clean_text(data.get('body'),3000)
-                if not body:self.send_json(400,{'error':'コメントを入力してください'});return
-                self.query(conn,'INSERT INTO comments(user_id,post_id,body,created_at) VALUES(?,?,?,?)',(user['id'],int(match.group(1)),body,now_iso()));conn.commit();self.send_json(201,{'ok':True});return
-            match=re.fullmatch(r'/api/mail/(\d+)/read',path)
-            if match:
-                cur=self.query(conn,'UPDATE messages SET is_read=1 WHERE id=? AND to_user_id=?',(int(match.group(1)),user['id']));conn.commit();self.send_json(200,{'ok':True});return
-            self.send_json(404,{'error':'APIが見つかりません'})
-        except Exception as e:
-            conn.rollback();print('POST API error:',repr(e),flush=True);self.send_json(500,{'error':'サーバーでエラーが発生しました'})
-        finally: conn.close()
+                    execute(
+                        conn,
+                        "INSERT INTO likes (user_id, post_id, created_at) "
+                        "VALUES (?, ?, ?)",
+                        (user["id"], post_id, now()),
+                    )
+                    liked = True
 
-    def api_patch_me(self):
-        try:data=self.read_json()
-        except Exception as e:self.send_json(400,{'error':str(e)});return
-        conn=self.db()
-        try:
-            user=self.require_user(conn)
-            if not user:return
-            display=clean_text(data.get('display_name'),40) or user['username']
-            self.query(conn,'UPDATE users SET display_name=? WHERE id=?',(display,user['id']));conn.commit()
-            updated=self.query(conn,'SELECT id,username,display_name,created_at FROM users WHERE id=?',(user['id'],)).fetchone();self.send_json(200,{'user':rowdict(updated)})
-        except Exception as e:conn.rollback();print('PATCH API error:',repr(e),flush=True);self.send_json(500,{'error':'サーバーでエラーが発生しました'})
-        finally:conn.close()
+                self.send_json(200, {"ok": True, "liked": liked})
+                return
 
-    def api_delete(self,path):
-        conn=self.db()
-        try:
-            user=self.require_user(conn)
-            if not user:return
-            match=re.fullmatch(r'/api/posts/(\d+)',path)
-            if match:
-                post=self.query(conn,'SELECT user_id FROM posts WHERE id=?',(int(match.group(1)),)).fetchone()
-                if not post:self.send_json(404,{'error':'投稿が見つかりません'});return
-                if post['user_id']!=user['id']:self.send_json(403,{'error':'自分の投稿だけ削除できます'});return
-                self.query(conn,'DELETE FROM posts WHERE id=?',(int(match.group(1)),));conn.commit();self.send_json(200,{'ok':True});return
-            match=re.fullmatch(r'/api/mail/(\d+)',path)
-            if match:
-                mid=int(match.group(1));msg=self.query(conn,'SELECT from_user_id,to_user_id FROM messages WHERE id=?',(mid,)).fetchone()
-                if not msg:self.send_json(404,{'error':'メッセージが見つかりません'});return
-                if msg['from_user_id']==user['id']:self.query(conn,'UPDATE messages SET deleted_by_sender=1 WHERE id=?',(mid,))
-                elif msg['to_user_id']==user['id']:self.query(conn,'UPDATE messages SET deleted_by_recipient=1 WHERE id=?',(mid,))
-                else:self.send_json(403,{'error':'このメッセージを削除できません'});return
-                conn.commit();self.send_json(200,{'ok':True});return
-            self.send_json(404,{'error':'APIが見つかりません'})
-        except Exception as e:conn.rollback();print('DELETE API error:',repr(e),flush=True);self.send_json(500,{'error':'サーバーでエラーが発生しました'})
-        finally:conn.close()
+            if path.startswith("/api/posts/") and path.endswith("/comments"):
+                user = require_user(self, conn)
+                parts = path.strip("/").split("/")
+                try:
+                    post_id = int(parts[2])
+                except (IndexError, ValueError):
+                    raise ApiError(400, "投稿IDが正しくありません。")
+
+                content = clean_text(data.get("content"), 2000)
+                if not content:
+                    raise ApiError(400, "コメントを入力してください。")
+
+                post = execute(
+                    conn,
+                    "SELECT id FROM posts WHERE id = ?",
+                    (post_id,),
+                ).fetchone()
+                if not post:
+                    raise ApiError(404, "投稿が見つかりません。")
+
+                execute(
+                    conn,
+                    """
+                    INSERT INTO comments
+                        (post_id, user_id, content, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (post_id, user["id"], content, now()),
+                )
+                self.send_json(201, {
+                    "ok": True,
+                    "message": "コメントしました。",
+                })
+                return
+
+            if path == "/api/mail":
+                user = require_user(self, conn)
+                receiver = clean_text(
+                    data.get("receiver_username")
+                    or data.get("username"),
+                    32,
+                )
+                content = clean_text(data.get("content"), 5000)
+
+                if not receiver or not content:
+                    raise ApiError(
+                        400,
+                        "相手のアカウント名とメッセージを入力してください。",
+                    )
+
+                recipient = execute(
+                    conn,
+                    "SELECT id FROM users WHERE username = ?",
+                    (receiver,),
+                ).fetchone()
+
+                if not recipient:
+                    raise ApiError(404, "相手のアカウントが見つかりません。")
+                if recipient["id"] == user["id"]:
+                    raise ApiError(400, "自分自身には送信できません。")
+
+                execute(
+                    conn,
+                    """
+                    INSERT INTO messages
+                        (sender_id, receiver_id, content, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (user["id"], recipient["id"], content, now()),
+                )
+                self.send_json(201, {
+                    "ok": True,
+                    "message": "メッセージを送信しました。",
+                })
+                return
+
+        raise ApiError(404, "指定されたAPIは存在しません。")
+
+    def api_delete(self, path):
+        with db_connection() as conn:
+            # 管理者によるアカウント削除
+            if path.startswith("/api/admin/users/"):
+                admin = require_admin(self, conn)
+                try:
+                    target_id = int(path.rsplit("/", 1)[1])
+                except ValueError:
+                    raise ApiError(400, "ユーザーIDが正しくありません。")
+
+                if target_id == admin["id"]:
+                    raise ApiError(
+                        400,
+                        "ログイン中の管理者自身は削除できません。",
+                    )
+
+                target = execute(
+                    conn,
+                    "SELECT id FROM users WHERE id = ?",
+                    (target_id,),
+                ).fetchone()
+                if not target:
+                    raise ApiError(404, "ユーザーが見つかりません。")
+
+                # 関連データも削除する。
+                execute(conn, "DELETE FROM sessions WHERE user_id = ?", (target_id,))
+                execute(conn, "DELETE FROM likes WHERE user_id = ?", (target_id,))
+                execute(conn, "DELETE FROM comments WHERE user_id = ?", (target_id,))
+                execute(
+                    conn,
+                    "DELETE FROM messages WHERE sender_id = ? OR receiver_id = ?",
+                    (target_id, target_id),
+                )
+
+                # ユーザーの投稿と、その投稿についたデータを削除。
+                post_rows = execute(
+                    conn,
+                    "SELECT id FROM posts WHERE user_id = ?",
+                    (target_id,),
+                ).fetchall()
+                for post in post_rows:
+                    execute(
+                        conn,
+                        "DELETE FROM likes WHERE post_id = ?",
+                        (post["id"],),
+                    )
+                    execute(
+                        conn,
+                        "DELETE FROM comments WHERE post_id = ?",
+                        (post["id"],),
+                    )
+                execute(conn, "DELETE FROM posts WHERE user_id = ?", (target_id,))
+                execute(conn, "DELETE FROM users WHERE id = ?", (target_id,))
+
+                self.send_json(200, {
+                    "ok": True,
+                    "message": "アカウントを削除しました。",
+                })
+                return
+
+            # 管理者による投稿削除
+            if path.startswith("/api/admin/posts/"):
+                require_admin(self, conn)
+                try:
+                    post_id = int(path.rsplit("/", 1)[1])
+                except ValueError:
+                    raise ApiError(400, "投稿IDが正しくありません。")
+
+                post = execute(
+                    conn,
+                    "SELECT id FROM posts WHERE id = ?",
+                    (post_id,),
+                ).fetchone()
+                if not post:
+                    raise ApiError(404, "投稿が見つかりません。")
+
+                execute(conn, "DELETE FROM likes WHERE post_id = ?", (post_id,))
+                execute(conn, "DELETE FROM comments WHERE post_id = ?", (post_id,))
+                execute(conn, "DELETE FROM posts WHERE id = ?", (post_id,))
+
+                self.send_json(200, {
+                    "ok": True,
+                    "message": "投稿を削除しました。",
+                })
+                return
+
+            # 投稿者本人による投稿削除
+            if path.startswith("/api/posts/"):
+                user = require_user(self, conn)
+                try:
+                    post_id = int(path.rsplit("/", 1)[1])
+                except ValueError:
+                    raise ApiError(400, "投稿IDが正しくありません。")
+
+                post = execute(
+                    conn,
+                    "SELECT id, user_id FROM posts WHERE id = ?",
+                    (post_id,),
+                ).fetchone()
+
+                if not post:
+                    raise ApiError(404, "投稿が見つかりません。")
+                if post["user_id"] != user["id"] and not bool(user["is_admin"]):
+                    raise ApiError(403, "自分の投稿だけ削除できます。")
+
+                execute(conn, "DELETE FROM likes WHERE post_id = ?", (post_id,))
+                execute(conn, "DELETE FROM comments WHERE post_id = ?", (post_id,))
+                execute(conn, "DELETE FROM posts WHERE id = ?", (post_id,))
+
+                self.send_json(200, {
+                    "ok": True,
+                    "message": "投稿を削除しました。",
+                })
+                return
+
+        raise ApiError(404, "指定されたAPIは存在しません。")
+
+    def serve_static(self, path):
+        # API以外は、アプリのファイルを配信する。
+        if path == "/":
+            path = "/index.html"
+
+        allowed_files = {
+            "/index.html",
+            "/app.js",
+            "/style.css",
+        }
+
+        if path not in allowed_files:
+            self.send_error_json(404, "ファイルが見つかりません。")
+            return
+
+        file_path = BASE_DIR / path.lstrip("/")
+        if not file_path.is_file():
+            self.send_error_json(
+                500,
+                f"{file_path.name} がサーバーにありません。",
+            )
+            return
+
+        content_type = {
+            ".html": "text/html; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+        }.get(file_path.suffix, "application/octet-stream")
+
+        body = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def main():
-    print(f'Japan Connect starting on port {PORT}; database={"PostgreSQL" if DBH.pg else "SQLite (local)"}', flush=True)
-    server=ThreadingHTTPServer(('0.0.0.0',PORT),Handler)
-    server.serve_forever()
+    init_database()
 
-if __name__=='__main__':
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        JapanConnectHandler,
+    )
+    logging.info("Japan Connect サーバーを起動しました。PORT=%s", PORT)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logging.info("サーバーを停止します。")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
     main()
