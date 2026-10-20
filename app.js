@@ -1,97 +1,714 @@
 
-'use strict';
-const $ = (s) => document.querySelector(s);
-const $$ = (s) => [...document.querySelectorAll(s)];
-let token = localStorage.getItem('jc_token') || '';
-let me = null;
-let currentPage = 'home';
-let previousPage = 'home';
-let authMode = 'login';
-let mailbox = 'inbox';
-let postsCache = [];
+const $ = (selector) => document.querySelector(selector);
 
-async function api(path, options={}) {
-  const headers = {'Content-Type':'application/json', ...(options.headers||{})};
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await fetch(`/api${path}`, {...options, headers});
-  const data = await res.json().catch(()=>({error:'サーバーから正しい応答がありません'}));
-  if (!res.ok) throw new Error(data.error || `エラー (${res.status})`);
+const state = {
+  token: localStorage.getItem("jc_token") || "",
+  me: null,
+  posts: [],
+  users: [],
+  messages: [],
+  page: "home",
+};
+
+async function api(path, options = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...(options.headers || {}),
+  };
+
+  if (state.token) {
+    headers.Authorization = `Bearer ${state.token}`;
+  }
+
+  let response;
+
+  try {
+    response = await fetch(path, {
+      ...options,
+      headers,
+    });
+  } catch {
+    throw new Error(
+      "サーバーに接続できません。サーバーの起動状態と公開URLを確認してください。"
+    );
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+
+  if (!contentType.includes("application/json")) {
+    throw new Error(
+      `サーバーからJSON以外の応答が返りました（HTTP ${response.status}）。サーバーの接続先を確認してください。`
+    );
+  }
+
+  let data;
+
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error("サーバーの応答を読み取れませんでした。");
+  }
+
+  if (!response.ok || data.ok === false) {
+    throw new Error(
+      data.message || data.error || `エラーが発生しました（HTTP ${response.status}）。`
+    );
+  }
+
   return data;
 }
-function escapeHtml(value='') { return String(value).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function toast(message) { const el=$('#toast'); el.textContent=message; el.classList.add('show'); setTimeout(()=>el.classList.remove('show'),2600); }
-function showMessage(selector, message, error=false) { const el=$(selector); if(el){el.textContent=message;el.style.color=error?'var(--danger)':'var(--muted)';} }
-function switchPage(name) {
-  if(name==='settings') { if(currentPage!=='settings') previousPage=currentPage; }
-  currentPage=name;
-  $$('.page').forEach(p=>p.classList.toggle('active-page',p.id===`${name}Page`));
-  $$('.nav-button').forEach(b=>b.classList.toggle('active',b.dataset.go===name));
-  $('#settingsToggle').textContent=name==='settings'?'↩ 戻る':'⚙ 設定';
-  window.scrollTo({top:0,behavior:'smooth'});
-  if(name==='home') loadPosts('homePosts');
-  if(name==='mychannel') loadPosts('myPosts', true);
-  if(name==='mail') loadMail();
-}
-function toggleSettings(){ if(currentPage==='settings') switchPage(previousPage||'home'); else switchPage('settings'); }
-function authScreen(isLoggedIn) { $('#authView').classList.toggle('hidden',isLoggedIn); $('#mainView').classList.toggle('hidden',!isLoggedIn); $('#bottomNav').classList.toggle('hidden',!isLoggedIn); $('#whoami').textContent=isLoggedIn?(me?.display_name||me?.username||''):''; }
-function renderPost(post) {
-  const liked=post.liked_by_me;
-  const kindLabels={text:'文章',image:'画像・GIF',video_vertical:'縦動画',video_horizontal:'横動画',file:'ファイル・書類',url:'URL'};
-  const body=escapeHtml(post.body||'');
-  const url=post.url?`<p><a class="inline-link" href="${escapeHtml(post.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(post.url)}</a></p>`:'';
-  return `<article class="post-card"><div class="post-meta"><span>${escapeHtml(post.display_name||post.username)} · ${escapeHtml(kindLabels[post.kind]||'投稿')}</span><span>${escapeHtml(post.created_at||'')}</span></div><h3>${escapeHtml(post.title||'（タイトルなし）')}</h3>${body?`<p>${body}</p>`:''}${url}<div class="post-meta"><span>♥ ${post.likes_count||0}　コメント ${post.comments_count||0}</span><span>${post.username===me?.username?'自分の投稿':''}</span></div><div class="post-actions"><button data-like="${post.id}" class="${liked?'liked':''}">${liked?'♥ いいね済み':'♡ いいね'}</button><button data-comment="${post.id}">コメント</button><button data-share="${post.id}">共有</button>${post.username===me?.username?`<button data-delete-post="${post.id}">削除</button>`:''}</div><div class="comments" id="comments-${post.id}"></div></article>`;
-}
-async function loadPosts(targetId, ownOnly=false) {
-  const target=$(`#${targetId}`); if(!target) return;
-  target.innerHTML='<div class="empty">読み込み中…</div>';
-  try {
-    const data=await api('/posts'); postsCache=data.posts||[];
-    const items=ownOnly?postsCache.filter(p=>p.username===me?.username):postsCache;
-    target.innerHTML=items.length?items.map(renderPost).join(''):'<div class="empty">まだ投稿がありません。マイチャンネルから最初の投稿を作ろう！</div>';
-  } catch(e){target.innerHTML=`<div class="empty">${escapeHtml(e.message)}</div>`;}
-}
-async function refreshVisiblePosts(){ await Promise.all([loadPosts('homePosts'),loadPosts('myPosts',true)]); }
-async function loadMail(){
-  const target=$('#mailList');target.innerHTML='<div class="empty">読み込み中…</div>';
-  try{
-    const data=await api(`/mail?box=${mailbox}`); const items=data.messages||[];
-    target.innerHTML=items.length?items.map(m=>`<article class="mail-card ${m.is_read?'':'unread'}"><div class="post-meta"><span>${mailbox==='inbox'?'送信者':'宛先'}：${escapeHtml(mailbox==='inbox'?m.from_username:m.to_username)}</span><span>${escapeHtml(m.created_at||'')}</span></div><h3>${escapeHtml(m.subject||'（件名なし）')}</h3><p class="mail-body">${escapeHtml(m.body)}</p><div class="post-actions">${mailbox==='inbox'&&!m.is_read?`<button data-read-mail="${m.id}">既読にする</button>`:''}<button data-delete-mail="${m.id}">削除</button></div></article>`).join(''):'<div class="empty">メッセージはありません。</div>';
-  }catch(e){target.innerHTML=`<div class="empty">${escapeHtml(e.message)}</div>`;}
-}
-async function loadUsers(query){
-  const target=$('#userResults');target.innerHTML='<div class="empty">検索中…</div>';
-  try{const data=await api(`/users?q=${encodeURIComponent(query)}`);const users=data.users||[];target.innerHTML=users.length?users.map(u=>`<article class="user-card"><div><strong>${escapeHtml(u.display_name||u.username)}</strong><p class="muted">@${escapeHtml(u.username)}</p></div><button class="button" data-message-user="${escapeHtml(u.username)}">メールする</button></article>`).join(''):'<div class="empty">アカウントが見つかりません。</div>';}catch(e){target.innerHTML=`<div class="empty">${escapeHtml(e.message)}</div>`;}
-}
-function setAuthMode(mode){authMode=mode;$$('[data-auth-mode]').forEach(b=>b.classList.toggle('active',b.dataset.authMode===mode));$('#displayNameLabel').classList.toggle('hidden',mode!=='register');$('#authSubmit').textContent=mode==='login'?'ログイン':'アカウントを作成';$('#authForm').elements.password.autocomplete=mode==='login'?'current-password':'new-password';showMessage('#authMessage','');}
-async function boot(){
-  const theme=localStorage.getItem('jc_theme')||'system';applyTheme(theme);document.body.dataset.font=localStorage.getItem('jc_font')||'normal';$('#themeSelect').value=theme;$('#fontSelect').value=document.body.dataset.font;
-  if(!token){authScreen(false);return;}
-  try{const data=await api('/me');me=data.user;authScreen(true);$('#settingsDisplayName').value=me.display_name||'';await refreshVisiblePosts();}
-  catch{token='';localStorage.removeItem('jc_token');authScreen(false);}
-}
-function applyTheme(theme){localStorage.setItem('jc_theme',theme);if(theme==='system')document.body.removeAttribute('data-theme');else document.body.dataset.theme=theme;}
 
-$$('[data-auth-mode]').forEach(b=>b.addEventListener('click',()=>setAuthMode(b.dataset.authMode)));
-$('#authForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget);const payload={username:f.get('username').trim(),password:f.get('password'),display_name:f.get('display_name')||''};try{const data=await api(authMode==='register'?'/register':'/login',{method:'POST',body:JSON.stringify(payload)});token=data.token;localStorage.setItem('jc_token',token);me=data.user;authScreen(true);$('#settingsDisplayName').value=me.display_name||'';showMessage('#authMessage','');toast(authMode==='register'?'アカウントを作成しました':'ログインしました');await refreshVisiblePosts();switchPage('home');}catch(err){showMessage('#authMessage',err.message,true);}});
-$('#settingsToggle').addEventListener('click',toggleSettings);
-$$('[data-go]').forEach(b=>b.addEventListener('click',()=>switchPage(b.dataset.go)));
-$$('[data-go-last]').forEach(b=>b.addEventListener('click',()=>switchPage(previousPage||'home')));
-$('#postKind').addEventListener('change',()=>{const kind=$('#postKind').value;$('#urlField').classList.toggle('hidden',kind!=='url');$('#fileField').classList.toggle('hidden',!['image','video_vertical','video_horizontal','file'].includes(kind));$('#fileHint').classList.toggle('hidden',!['image','video_vertical','video_horizontal','file'].includes(kind));});
-$('#postForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget);const attachment=f.get('attachment');const payload={kind:f.get('kind'),title:f.get('title').trim(),body:f.get('body').trim(),url:f.get('url').trim()};if(attachment&&attachment.size>0){showMessage('#postMessage','選択したファイル本体はまだアップロードされません。タイトル・説明・投稿種類のみ保存します。');}try{await api('/posts',{method:'POST',body:JSON.stringify(payload)});e.currentTarget.reset();$('#postKind').dispatchEvent(new Event('change'));showMessage('#postMessage','投稿しました');await refreshVisiblePosts();switchPage('mychannel');}catch(err){showMessage('#postMessage',err.message,true);}});
-$('#mailForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget);try{await api('/mail',{method:'POST',body:JSON.stringify({to_username:f.get('to').trim(),subject:f.get('subject').trim(),body:f.get('body').trim()})});e.currentTarget.reset();showMessage('#mailMessage','送信しました');mailbox='sent';$$('[data-mailbox]').forEach(b=>b.classList.toggle('active',b.dataset.mailbox===mailbox));await loadMail();}catch(err){showMessage('#mailMessage',err.message,true);}});
-$$('[data-mailbox]').forEach(b=>b.addEventListener('click',()=>{mailbox=b.dataset.mailbox;$$('[data-mailbox]').forEach(x=>x.classList.toggle('active',x===b));loadMail();}));
-$('#searchForm').addEventListener('submit',async e=>{e.preventDefault();const q=new FormData(e.currentTarget).get('q').trim().toLowerCase();const target=$('#searchResults');if(!q){target.innerHTML='<div class="empty">キーワードを入力してください。</div>';return;}try{const data=await api('/posts');const results=(data.posts||[]).filter(p=>`${p.title} ${p.body} ${p.username} ${p.display_name}`.toLowerCase().includes(q));target.innerHTML=results.length?results.map(renderPost).join(''):'<div class="empty">該当する投稿はありません。</div>';}catch(err){target.innerHTML=`<div class="empty">${escapeHtml(err.message)}</div>`;}});
-$('#userSearchForm').addEventListener('submit',e=>{e.preventDefault();loadUsers(new FormData(e.currentTarget).get('q').trim());});
-$('#themeSelect').addEventListener('change',e=>applyTheme(e.target.value));$('#fontSelect').addEventListener('change',e=>{document.body.dataset.font=e.target.value;localStorage.setItem('jc_font',e.target.value);});
-$('#saveProfile').addEventListener('click',async()=>{try{const data=await api('/me',{method:'PATCH',body:JSON.stringify({display_name:$('#settingsDisplayName').value.trim()})});me=data.user;$('#whoami').textContent=me.display_name||me.username;toast('表示名を保存しました');}catch(e){toast(e.message);}});
-$('#logoutButton').addEventListener('click',async()=>{try{await api('/logout',{method:'POST',body:'{}'});}catch{}token='';me=null;localStorage.removeItem('jc_token');authScreen(false);switchPage('home');toast('ログアウトしました');});
-document.addEventListener('click',async e=>{
- const like=e.target.closest('[data-like]');if(like){try{await api(`/posts/${like.dataset.like}/like`,{method:'POST',body:'{}'});await refreshVisiblePosts();}catch(err){toast(err.message);}return;}
- const del=e.target.closest('[data-delete-post]');if(del&&confirm('この投稿を削除しますか？')){try{await api(`/posts/${del.dataset.deletePost}`,{method:'DELETE'});await refreshVisiblePosts();toast('投稿を削除しました');}catch(err){toast(err.message);}return;}
- const comment=e.target.closest('[data-comment]');if(comment){const body=prompt('コメントを入力してください');if(body&&body.trim()){try{await api(`/posts/${comment.dataset.comment}/comments`,{method:'POST',body:JSON.stringify({body:body.trim()})});toast('コメントしました');}catch(err){toast(err.message);}}return;}
- const share=e.target.closest('[data-share]');if(share){const url=`${location.origin}/#post-${share.dataset.share}`;try{await navigator.clipboard.writeText(url);toast('投稿リンクをコピーしました');}catch{prompt('このリンクをコピーしてください',url);}return;}
- const read=e.target.closest('[data-read-mail]');if(read){try{await api(`/mail/${read.dataset.readMail}/read`,{method:'POST',body:'{}'});await loadMail();}catch(err){toast(err.message);}return;}
- const delMail=e.target.closest('[data-delete-mail]');if(delMail&&confirm('このメッセージを削除しますか？')){try{await api(`/mail/${delMail.dataset.deleteMail}`,{method:'DELETE'});await loadMail();}catch(err){toast(err.message);}return;}
- const msgUser=e.target.closest('[data-message-user]');if(msgUser){switchPage('mail');$('#mailForm').elements.to.value=msgUser.dataset.messageUser;$('#mailForm').elements.body.focus();}
-});
-setAuthMode('login');boot();
+function escapeHTML(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[character]);
+}
+
+function showNotice(message, isError = false) {
+  let notice = $("#jc-notice");
+
+  if (!notice) {
+    notice = document.createElement("div");
+    notice.id = "jc-notice";
+    notice.className = "notice";
+    document.body.appendChild(notice);
+  }
+
+  notice.textContent = message;
+  notice.classList.toggle("notice-error", isError);
+  notice.hidden = false;
+}
+
+function showError(error) {
+  console.error(error);
+  showNotice(error.message || "エラーが発生しました。", true);
+}
+
+function saveToken(token) {
+  state.token = token || "";
+
+  if (state.token) {
+    localStorage.setItem("jc_token", state.token);
+  } else {
+    localStorage.removeItem("jc_token");
+  }
+}
+
+function showAuth() {
+  $("#auth-view").hidden = false;
+  $("#app-view").hidden = true;
+}
+
+function showApp() {
+  $("#auth-view").hidden = true;
+  $("#app-view").hidden = false;
+
+  const name = $("#current-user");
+  if (name && state.me) {
+    name.textContent = state.me.display_name || state.me.username;
+  }
+
+  document.body.classList.toggle(
+    "dark-mode",
+    localStorage.getItem("jc_dark") === "true"
+  );
+
+  const adminNav = $("#nav-admin");
+  if (adminNav) {
+    adminNav.hidden = !state.me?.is_admin;
+  }
+}
+
+function setAuthMode(mode) {
+  const register = mode === "register";
+
+  $("#auth-title").textContent = register
+    ? "アカウントを作成"
+    : "Japan Connect にログイン";
+
+  $("#auth-submit").textContent = register
+    ? "アカウント作成"
+    : "ログイン";
+
+  $("#display-name-field").hidden = !register;
+  $("#auth-switch").textContent = register
+    ? "すでにアカウントを持っている場合はログイン"
+    : "初めての方はアカウントを作成";
+
+  $("#auth-form").dataset.mode = mode;
+  $("#auth-error").textContent = "";
+}
+
+async function handleAuth(event) {
+  event.preventDefault();
+
+  const mode = $("#auth-form").dataset.mode || "login";
+  const username = $("#username").value.trim();
+  const password = $("#password").value;
+  const displayName = $("#display-name").value.trim();
+
+  const button = $("#auth-submit");
+  button.disabled = true;
+  button.textContent = "処理中…";
+  $("#auth-error").textContent = "";
+
+  try {
+    const result = await api(
+      mode === "register" ? "/api/register" : "/api/login",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          username,
+          password,
+          display_name: displayName || username,
+        }),
+      }
+    );
+
+    if (!result.token || !result.user) {
+      throw new Error(
+        "サーバーの応答にログイン情報がありません。サーバー側の設定を確認してください。"
+      );
+    }
+
+    saveToken(result.token);
+    state.me = result.user;
+
+    showApp();
+    await navigate("home");
+    showNotice(result.message || "ログインしました。");
+  } catch (error) {
+    $("#auth-error").textContent = error.message;
+    showError(error);
+  } finally {
+    button.disabled = false;
+    button.textContent =
+      ($("#auth-form").dataset.mode || "login") === "register"
+        ? "アカウント作成"
+        : "ログイン";
+  }
+}
+
+async function loadMe() {
+  const result = await api("/api/me");
+  state.me = result.user;
+  return state.me;
+}
+
+function formatDate(value) {
+  if (!value) return "";
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return date.toLocaleString("ja-JP");
+}
+
+function renderPost(post) {
+  const isOwner = Number(post.user_id) === Number(state.me?.id);
+  const canDelete = isOwner || Boolean(state.me?.is_admin);
+
+  const comments = (post.comments || []).map((comment) => `
+    <div class="comment">
+      <strong>${escapeHTML(comment.display_name || comment.username)}</strong>
+      <span>${escapeHTML(comment.content)}</span>
+    </div>
+  `).join("");
+
+  return `
+    <article class="post" data-post-id="${Number(post.id)}">
+      <div class="post-header">
+        <div>
+          <strong>${escapeHTML(post.display_name || post.username)}</strong>
+          <div class="muted">@${escapeHTML(post.username)}</div>
+        </div>
+        <time>${escapeHTML(formatDate(post.created_at))}</time>
+      </div>
+
+      <p class="post-content">${escapeHTML(post.content)}</p>
+
+      <div class="post-actions">
+        <button type="button" data-action="like" data-id="${Number(post.id)}">
+          ${post.liked ? "♥" : "♡"} いいね (${Number(post.likes) || 0})
+        </button>
+        ${
+          canDelete
+            ? `<button type="button" class="danger" data-action="delete-post" data-id="${Number(post.id)}">削除</button>`
+            : ""
+        }
+      </div>
+
+      <div class="comments">
+        ${comments}
+        <form class="comment-form" data-id="${Number(post.id)}">
+          <input name="content" maxlength="2000" placeholder="コメントを書く" required>
+          <button type="submit">送信</button>
+        </form>
+      </div>
+    </article>
+  `;
+}
+
+async function loadPosts() {
+  const result = await api("/api/posts");
+  state.posts = result.posts || [];
+  return state.posts;
+}
+
+async function renderHome() {
+  const posts = await loadPosts();
+
+  $("#page-content").innerHTML = `
+    <section class="panel">
+      <h2>ホーム</h2>
+      <form id="post-form">
+        <textarea name="content" maxlength="10000" placeholder="今何をしていますか？" required></textarea>
+        <button type="submit">投稿する</button>
+      </form>
+    </section>
+    <section class="post-list">
+      ${posts.length
+        ? posts.map(renderPost).join("")
+        : '<p class="empty">まだ投稿がありません。最初の投稿をしてみよう！</p>'}
+    </section>
+  `;
+}
+
+async function renderMyChannel() {
+  const posts = await loadPosts();
+  const mine = posts.filter(
+    (post) => Number(post.user_id) === Number(state.me?.id)
+  );
+
+  $("#page-content").innerHTML = `
+    <section class="panel">
+      <h2>マイチャンネル</h2>
+      <p>自分の投稿を確認できます。</p>
+      <p>投稿数：${mine.length}</p>
+    </section>
+    <section class="post-list">
+      ${mine.length
+        ? mine.map(renderPost).join("")
+        : '<p class="empty">まだ投稿がありません。</p>'}
+    </section>
+  `;
+}
+
+async function renderMail() {
+  const result = await api("/api/mail");
+  state.messages = result.messages || [];
+
+  $("#page-content").innerHTML = `
+    <section class="panel">
+      <h2>メール</h2>
+      <p class="muted">相手のアカウント名を入力してメッセージを送信します。</p>
+      <form id="mail-form">
+        <label>送信先のアカウント名
+          <input name="receiver_username" required maxlength="32">
+        </label>
+        <label>メッセージ
+          <textarea name="content" required maxlength="5000"></textarea>
+        </label>
+        <button type="submit">送信する</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>メッセージ一覧</h2>
+      ${state.messages.length
+        ? state.messages.map((message) => {
+            const sent = Number(message.sender_id) === Number(state.me.id);
+            const other = sent
+              ? message.receiver_name || message.receiver_username
+              : message.sender_name || message.sender_username;
+
+            return `
+              <article class="message">
+                <strong>${sent ? "送信先" : "送信元"}：${escapeHTML(other)}</strong>
+                <p>${escapeHTML(message.content)}</p>
+                <time>${escapeHTML(formatDate(message.created_at))}</time>
+              </article>
+            `;
+          }).join("")
+        : '<p class="empty">メッセージはまだありません。</p>'}
+    </section>
+  `;
+}
+
+async function renderFriends() {
+  const result = await api("/api/friends");
+  state.users = result.friends || [];
+
+  $("#page-content").innerHTML = `
+    <section class="panel">
+      <h2>ユーザー検索</h2>
+      <input id="user-search" placeholder="アカウント名や表示名で検索">
+      <div id="user-results"></div>
+    </section>
+  `;
+
+  const draw = () => {
+    const query = ($("#user-search").value || "").toLowerCase();
+    const matches = state.users.filter((user) =>
+      `${user.username} ${user.display_name}`.toLowerCase().includes(query)
+    );
+
+    $("#user-results").innerHTML = matches.length
+      ? matches.map((user) => `
+          <article class="user-card">
+            <div>
+              <strong>${escapeHTML(user.display_name || user.username)}</strong>
+              <p class="muted">@${escapeHTML(user.username)}</p>
+            </div>
+            <button type="button" data-action="message-user"
+              data-username="${escapeHTML(user.username)}">メールする</button>
+          </article>
+        `).join("")
+      : '<p class="empty">ユーザーが見つかりません。</p>';
+  };
+
+  $("#user-search").addEventListener("input", draw);
+  draw();
+}
+
+async function renderSearch() {
+  const posts = await loadPosts();
+
+  $("#page-content").innerHTML = `
+    <section class="panel">
+      <h2>投稿検索</h2>
+      <input id="post-search" placeholder="投稿内容やユーザー名で検索">
+      <div id="search-results" class="post-list"></div>
+    </section>
+  `;
+
+  const draw = () => {
+    const query = ($("#post-search").value || "").toLowerCase();
+    const matches = posts.filter((post) =>
+      `${post.content} ${post.username} ${post.display_name}`
+        .toLowerCase().includes(query)
+    );
+
+    $("#search-results").innerHTML = matches.length
+      ? matches.map(renderPost).join("")
+      : '<p class="empty">一致する投稿がありません。</p>';
+  };
+
+  $("#post-search").addEventListener("input", draw);
+  draw();
+}
+
+async function renderSettings() {
+  $("#page-content").innerHTML = `
+    <section class="panel">
+      <h2>設定</h2>
+      <p>ログイン中：${escapeHTML(state.me.display_name || state.me.username)}</p>
+      <label class="setting-row">
+        <span>ダークモード</span>
+        <input type="checkbox" id="dark-toggle"
+          ${localStorage.getItem("jc_dark") === "true" ? "checked" : ""}>
+      </label>
+      <button type="button" id="logout-button" class="danger">ログアウト</button>
+    </section>
+  `;
+
+  $("#dark-toggle").addEventListener("change", (event) => {
+    const enabled = event.target.checked;
+    localStorage.setItem("jc_dark", String(enabled));
+    document.body.classList.toggle("dark-mode", enabled);
+  });
+
+  $("#logout-button").addEventListener("click", logout);
+}
+
+async function renderAdmin() {
+  if (!state.me?.is_admin) {
+    throw new Error("管理者のみ利用できる画面です。");
+  }
+
+  const [usersResult, postsResult] = await Promise.all([
+    api("/api/admin/users"),
+    api("/api/admin/posts"),
+  ]);
+
+  const users = usersResult.users || [];
+  const posts = postsResult.posts || [];
+
+  $("#page-content").innerHTML = `
+    <section class="panel">
+      <h2>管理者画面</h2>
+      <p>ユーザー数：${users.length} ／ 投稿数：${posts.length}</p>
+      <p class="muted">削除操作は取り消せません。対象を確認してから操作してください。</p>
+    </section>
+
+    <section class="panel">
+      <h3>アカウント管理</h3>
+      <div class="admin-list">
+        ${users.map((user) => `
+          <article class="user-card">
+            <div>
+              <strong>${escapeHTML(user.display_name || user.username)}</strong>
+              <p class="muted">@${escapeHTML(user.username)} · ID ${Number(user.id)}</p>
+              ${user.is_admin ? '<span class="admin-label">管理者</span>' : ""}
+            </div>
+            ${
+              Number(user.id) !== Number(state.me.id)
+                ? `<button type="button" class="danger"
+                    data-action="admin-delete-user" data-id="${Number(user.id)}">
+                    アカウント削除
+                  </button>`
+                : '<span class="muted">ログイン中</span>'
+            }
+          </article>
+        `).join("")}
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3>投稿管理</h3>
+      <div class="admin-list">
+        ${posts.map((post) => `
+          <article class="admin-post">
+            <div>
+              <strong>${escapeHTML(post.display_name || post.username)}</strong>
+              <p>${escapeHTML(post.content)}</p>
+              <span class="muted">投稿ID：${Number(post.id)}</span>
+            </div>
+            <button type="button" class="danger"
+              data-action="admin-delete-post" data-id="${Number(post.id)}">
+              投稿削除
+            </button>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+async function navigate(page) {
+  state.page = page;
+
+  const titles = {
+    home: "ホーム",
+    channel: "マイチャンネル",
+    mail: "メール",
+    search: "検索",
+    friends: "ユーザー",
+    settings: "設定",
+    admin: "管理者",
+  };
+
+  $("#page-title").textContent = titles[page] || "Japan Connect";
+
+  document.querySelectorAll("[data-page]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.page === page);
+  });
+
+  try {
+    if (page === "home") await renderHome();
+    else if (page === "channel") await renderMyChannel();
+    else if (page === "mail") await renderMail();
+    else if (page === "search") await renderSearch();
+    else if (page === "friends") await renderFriends();
+    else if (page === "settings") await renderSettings();
+    else if (page === "admin") await renderAdmin();
+    else throw new Error("指定された画面はありません。");
+  } catch (error) {
+    showError(error);
+    $("#page-content").innerHTML = `
+      <section class="panel">
+        <h2>読み込みに失敗しました</h2>
+        <p>${escapeHTML(error.message)}</p>
+        <button type="button" id="retry-button">再読み込み</button>
+      </section>
+    `;
+    $("#retry-button").addEventListener("click", () => navigate(page));
+  }
+}
+
+async function logout() {
+  try {
+    await api("/api/logout", { method: "POST", body: "{}" });
+  } catch (error) {
+    console.warn("ログアウト通知に失敗しました", error);
+  }
+
+  saveToken("");
+  state.me = null;
+  showAuth();
+  setAuthMode("login");
+  showNotice("ログアウトしました。");
+}
+
+async function handlePageSubmit(event) {
+  const form = event.target;
+
+  if (form.id === "post-form") {
+    event.preventDefault();
+
+    const content = new FormData(form).get("content");
+
+    try {
+      await api("/api/posts", {
+        method: "POST",
+        body: JSON.stringify({ content }),
+      });
+
+      showNotice("投稿しました。");
+      await navigate(state.page);
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  if (form.classList.contains("comment-form")) {
+    event.preventDefault();
+
+    const content = new FormData(form).get("content");
+    const postId = form.dataset.id;
+
+    try {
+      await api(`/api/posts/${postId}/comments`, {
+        method: "POST",
+        body: JSON.stringify({ content }),
+      });
+
+      showNotice("コメントしました。");
+      await navigate(state.page);
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  if (form.id === "mail-form") {
+    event.preventDefault();
+
+    const formData = new FormData(form);
+
+    try {
+      await api("/api/mail", {
+        method: "POST",
+        body: JSON.stringify({
+          receiver_username: formData.get("receiver_username"),
+          content: formData.get("content"),
+        }),
+      });
+
+      showNotice("メッセージを送信しました。");
+      await navigate("mail");
+    } catch (error) {
+      showError(error);
+    }
+  }
+}
+
+async function handleActionClick(event) {
+  const button = event.target.closest("[data-action]");
+  if (!button) return;
+
+  const action = button.dataset.action;
+  const id = button.dataset.id;
+
+  try {
+    button.disabled = true;
+
+    if (action === "like") {
+      await api(`/api/posts/${id}/like`, {
+        method: "POST",
+        body: "{}",
+      });
+      await navigate(state.page);
+    }
+
+    if (action === "delete-post") {
+      if (!confirm("この投稿を削除しますか？")) return;
+
+      await api(`/api/posts/${id}`, { method: "DELETE" });
+      showNotice("投稿を削除しました。");
+      await navigate(state.page);
+    }
+
+    if (action === "admin-delete-user") {
+      if (!confirm("このアカウントと関連データを削除しますか？")) return;
+
+      await api(`/api/admin/users/${id}`, { method: "DELETE" });
+      showNotice("アカウントを削除しました。");
+      await navigate("admin");
+    }
+
+    if (action === "admin-delete-post") {
+      if (!confirm("この投稿を削除しますか？")) return;
+
+      await api(`/api/admin/posts/${id}`, { method: "DELETE" });
+      showNotice("投稿を削除しました。");
+      await navigate("admin");
+    }
+
+    if (action === "message-user") {
+      const username = button.dataset.username;
+      await navigate("mail");
+
+      const receiver = document.querySelector(
+        '#mail-form [name="receiver_username"]'
+      );
+
+      if (receiver) {
+        receiver.value = username;
+        receiver.focus();
+      }
+    }
+  } catch (error) {
+    showError(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function startApp() {
+  setAuthMode("login");
+
+  $("#auth-form").addEventListener("submit", handleAuth);
+
+  $("#auth-switch").addEventListener("click", () => {
+    const current = $("#auth-form").dataset.mode || "login";
+    setAuthMode(current === "login" ? "register" : "login");
+  });
+
+  document.querySelectorAll("[data-page]").forEach((button) => {
+    button.addEventListener("click", () => navigate(button.dataset.page));
+  });
+
+  $("#page-content").addEventListener("submit", handlePageSubmit);
+  $("#page-content").addEventListener("click", handleActionClick);
+
+  if (!state.token) {
+    showAuth();
+    return;
+  }
+
+  try {
+    await loadMe();
+
+    if (!state.me) {
+      saveToken("");
+      showAuth();
+      return;
+    }
+
+    showApp();
+    await navigate("home");
+  } catch (error) {
+    console.error(error);
+    saveToken("");
+    state.me = null;
+    showAuth();
+  }
+}
+
+document.addEventListener("DOMContentLoaded", startApp);
