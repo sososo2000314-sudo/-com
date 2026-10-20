@@ -1,0 +1,22 @@
+
+name = "japan-connect"
+main = "worker.js"
+compatibility_date = "2026-10-20"
+
+[assets]
+directory = "."
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+exclude = [
+  ".git/**",
+  "Dockerfile",
+  "requirements.txt",
+  "*.py",
+  "wrangler.toml",
+  "worker.js"
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "japan-connect-db"
+database_id = "77ba921b-aef5-4c74-8c3a-9a0ebf8a87e7"
