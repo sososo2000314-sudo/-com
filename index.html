@@ -1,1 +1,100 @@
 
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1769aa">
+  <title>Japan Connect 🇯🇵</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#home" aria-label="Japan Connect ホーム">🇯🇵 Japan Connect</a>
+    <div class="top-actions"><span id="whoami" class="muted"></span><button id="settingsToggle" class="button secondary">⚙ 設定</button></div>
+  </header>
+
+  <main class="app-shell">
+    <section id="authView" class="auth-card">
+      <h1>Japan Connect へようこそ</h1>
+      <p class="muted">アカウントを作成するか、ログインしてください。</p>
+      <div class="tabs"><button class="tab active" data-auth-mode="login">ログイン</button><button class="tab" data-auth-mode="register">新規登録</button></div>
+      <form id="authForm">
+        <label>アカウント名<input name="username" required minlength="3" maxlength="32" autocomplete="username" placeholder="英数字と _ - .（3〜32文字）"></label>
+        <label id="displayNameLabel" class="hidden">表示名<input name="display_name" maxlength="40" placeholder="みんなに表示する名前"></label>
+        <label>パスワード<input name="password" type="password" required minlength="8" autocomplete="current-password" placeholder="8文字以上"></label>
+        <button class="button primary full" type="submit" id="authSubmit">ログイン</button>
+      </form>
+      <p id="authMessage" class="notice" role="status"></p>
+    </section>
+
+    <section id="mainView" class="hidden">
+      <div id="homePage" class="page active-page">
+        <div class="page-heading"><div><h1>ホーム</h1><p class="muted">フォロー中の投稿や、みんなの投稿を見よう。</p></div><button class="button" data-go="mychannel">＋ 投稿を作る</button></div>
+        <div id="homePosts" class="post-list"></div>
+      </div>
+
+      <div id="mychannelPage" class="page">
+        <div class="page-heading"><div><h1>マイチャンネル</h1><p class="muted">投稿はここから作成します。</p></div></div>
+        <form id="postForm" class="composer">
+          <label>投稿の種類<select name="kind" id="postKind"><option value="text">文章</option><option value="image">画像・GIF</option><option value="video_vertical">縦動画</option><option value="video_horizontal">横動画</option><option value="file">ファイル・書類</option><option value="url">URL</option></select></label>
+          <label>タイトル<input name="title" maxlength="160" required placeholder="投稿のタイトル"></label>
+          <label>説明・本文<textarea name="body" maxlength="10000" rows="4" placeholder="伝えたいことを書こう"></textarea></label>
+          <label id="urlField" class="hidden">URL<input name="url" type="url" placeholder="https://example.com"></label>
+          <label id="fileField" class="hidden">ファイルを選択<input name="attachment" type="file" accept="image/*,video/*,.pdf,.txt,.doc,.docx,.zip"></label>
+          <p id="fileHint" class="muted small">※この試作版では、ファイル本体のサーバーアップロードは未実装です。投稿本文と種類は保存されます。</p>
+          <button class="button primary" type="submit">投稿する</button>
+          <p id="postMessage" class="notice" role="status"></p>
+        </form>
+        <h2>自分の投稿</h2><div id="myPosts" class="post-list"></div>
+      </div>
+
+      <div id="mailPage" class="page">
+        <div class="page-heading"><div><h1>メール</h1><p class="muted">アカウント名を指定してメッセージを送れます。</p></div></div>
+        <form id="mailForm" class="composer">
+          <label>宛先アカウント名<input name="to" required maxlength="32" placeholder="相手のアカウント名"></label>
+          <label>件名<input name="subject" maxlength="160" placeholder="件名（任意）"></label>
+          <label>メッセージ<textarea name="body" required maxlength="10000" rows="4" placeholder="メッセージを書く"></textarea></label>
+          <button class="button primary" type="submit">送信する</button><p id="mailMessage" class="notice" role="status"></p>
+        </form>
+        <div class="section-tabs"><button class="tab active" data-mailbox="inbox">受信箱</button><button class="tab" data-mailbox="sent">送信済み</button></div>
+        <div id="mailList" class="mail-list"></div>
+      </div>
+
+      <div id="searchPage" class="page">
+        <div class="page-heading"><div><h1>検索</h1><p class="muted">投稿のタイトル・本文・投稿者を検索できます。</p></div></div>
+        <form id="searchForm" class="search-row"><input name="q" placeholder="キーワードを入力"><button class="button primary">検索</button></form>
+        <div id="searchResults" class="post-list"></div>
+      </div>
+
+      <div id="friendsPage" class="page">
+        <div class="page-heading"><div><h1>友達・アカウント</h1><p class="muted">アカウント名を検索して、プロフィールを確認できます。</p></div></div>
+        <form id="userSearchForm" class="search-row"><input name="q" placeholder="アカウント名"><button class="button primary">検索</button></form>
+        <div id="userResults" class="user-list"></div>
+      </div>
+
+      <div id="settingsPage" class="page">
+        <div class="page-heading"><div><h1>設定</h1><p class="muted">表示とアカウントの設定</p></div><button class="button secondary" data-go-last>↩ 戻る</button></div>
+        <div class="settings-card">
+          <label>表示名<input id="settingsDisplayName" maxlength="40" placeholder="表示名"></label>
+          <button id="saveProfile" class="button">表示名を保存</button>
+          <label>テーマ<select id="themeSelect"><option value="system">端末に合わせる</option><option value="light">ライト</option><option value="dark">ダーク</option></select></label>
+          <label>文字サイズ<select id="fontSelect"><option value="normal">標準</option><option value="large">大きめ</option></select></label>
+          <button id="logoutButton" class="button danger">ログアウト</button>
+          <p class="muted small">管理者機能や通知などは、サーバー側の安全な実装が必要なため、この初期版には含めていません。</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <nav id="bottomNav" class="bottom-nav hidden" aria-label="メインメニュー">
+    <button data-go="home" class="nav-button active">⌂<span>ホーム</span></button>
+    <button data-go="mychannel" class="nav-button">▣<span>マイチャンネル</span></button>
+    <button data-go="mail" class="nav-button">✉<span>メール</span></button>
+    <button data-go="search" class="nav-button">⌕<span>検索</span></button>
+    <button data-go="friends" class="nav-button">♙<span>友達</span></button>
+  </nav>
+  <div id="toast" class="toast" role="status"></div>
+</body>
+</html>
