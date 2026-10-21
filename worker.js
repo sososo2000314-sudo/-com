@@ -47,6 +47,11 @@ const SCHEMA = [
     is_read INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
+  `CREATE TABLE IF NOT EXISTS admin_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    password_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
 ];
 
 const json = (data, status = 200) =>
@@ -153,8 +158,11 @@ async function requireUser(request, db) {
 
 async function requireAdmin(request, db) {
   const user = await requireUser(request, db);
-  if (!user.is_admin) {
-    throw new Error("管理者のみ利用できる操作です。");
+  if (!user.is_admin) throw new Error("管理者のみ利用できる操作です。");
+  const config = await db.prepare("SELECT password_hash FROM admin_config WHERE id = 1").first();
+  if (config) {
+    const supplied = request.headers.get("X-Admin-Password") || "";
+    if (!(await verifyPassword(supplied, config.password_hash))) throw new Error("管理者パスワードが違います。");
   }
   return user;
 }
@@ -305,6 +313,11 @@ async function handleAPI(request, env) {
     return json({ ok: true, message: "ログアウトしました。" });
   }
 
+  // ゲストも投稿一覧だけは閲覧可能
+  if (path === "/api/public/posts" && method === "GET") {
+    return json({ ok: true, posts: await listPosts(db, null) });
+  }
+
   // ここからログインが必要
   const user = await requireUser(request, db);
 
@@ -434,13 +447,14 @@ async function handleAPI(request, env) {
   if (path === "/api/users" && method === "GET") {
     const query = String(url.searchParams.get("q") || "").trim();
     const result = await db.prepare(`
-      SELECT id, username, display_name, avatar, is_admin
-      FROM users
-      WHERE id != ? AND (username LIKE ? OR display_name LIKE ?)
-      ORDER BY username LIMIT 100
-    `).bind(user.id, `%${query}%`, `%${query}%`).all();
+      SELECT u.id, u.username, u.display_name, u.avatar, u.is_admin,
+        EXISTS(SELECT 1 FROM follows f WHERE f.user_id = ? AND f.followed_id = u.id) AS following
+      FROM users u
+      WHERE u.id != ? AND (u.username LIKE ? OR u.display_name LIKE ?)
+      ORDER BY u.username LIMIT 100
+    `).bind(user.id, user.id, `%${query}%`, `%${query}%`).all();
 
-    return json({ ok: true, users: (result.results || []).map(publicUser) });
+    return json({ ok: true, users: (result.results || []).map(u => ({ ...publicUser(u), following: Boolean(u.following) })) });
   }
 
   // メール一覧
@@ -491,6 +505,44 @@ async function handleAPI(request, env) {
     return json({ ok: true, message: "メッセージを送信しました。" }, 201);
   }
 
+  // フォローの追加・解除
+  match = path.match(/^\/api\/users\/(\d+)\/follow$/);
+  if (match && method === "POST") {
+    const followedId = Number(match[1]);
+    if (followedId === Number(user.id)) return fail("自分自身はフォローできません。");
+    const target = await db.prepare("SELECT id FROM users WHERE id = ?").bind(followedId).first();
+    if (!target) return fail("ユーザーが見つかりません。", 404);
+    const exists = await db.prepare("SELECT 1 FROM follows WHERE user_id = ? AND followed_id = ?").bind(user.id, followedId).first();
+    if (exists) await db.prepare("DELETE FROM follows WHERE user_id = ? AND followed_id = ?").bind(user.id, followedId).run();
+    else await db.prepare("INSERT INTO follows (user_id, followed_id) VALUES (?, ?)").bind(user.id, followedId).run();
+    return json({ ok: true, following: !exists });
+  }
+
+  // メール削除（送信者または受信者本人のみ）
+  match = path.match(/^\/api\/mail\/(\d+)$/);
+  if (match && method === "DELETE") {
+    const messageId = Number(match[1]);
+    const message = await db.prepare("SELECT id, sender_id, receiver_id FROM messages WHERE id = ?").bind(messageId).first();
+    if (!message) return fail("メールが見つかりません。", 404);
+    if (Number(message.sender_id) !== Number(user.id) && Number(message.receiver_id) !== Number(user.id)) return fail("このメールを削除する権限がありません。", 403);
+    await db.prepare("DELETE FROM messages WHERE id = ?").bind(messageId).run();
+    return json({ ok: true, message: "メールを削除しました。" });
+  }
+
+  // 管理者パスワードの設定・変更（初回は管理者ログインのみで設定可能）
+  if (path === "/api/admin/password" && method === "POST") {
+    if (!user.is_admin) return fail("管理者のみ設定できます。", 403);
+    const data = await bodyJSON(request);
+    const nextPassword = String(data.new_password || "");
+    const currentPassword = String(data.current_password || "");
+    const config = await db.prepare("SELECT password_hash FROM admin_config WHERE id = 1").first();
+    if (config && !(await verifyPassword(currentPassword, config.password_hash))) return fail("現在の管理者パスワードが違います。", 403);
+    if (nextPassword.length < 8 || nextPassword.length > 128) return fail("管理者パスワードは8〜128文字にしてください。");
+    const hashed = await hashPassword(nextPassword);
+    await db.prepare(`INSERT INTO admin_config (id, password_hash, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET password_hash = excluded.password_hash, updated_at = CURRENT_TIMESTAMP`).bind(hashed).run();
+    return json({ ok: true, message: "管理者パスワードを保存しました。" });
+  }
+
   if (path === "/api/admin/users" && method === "GET") {
     await requireAdmin(request, db);
     const result = await db.prepare(`
@@ -511,9 +563,6 @@ async function handleAPI(request, env) {
     await requireAdmin(request, db);
     const targetId = Number(match[1]);
 
-    if (targetId === Number(user.id)) {
-      return fail("自分のアカウントはこの画面から削除できません。");
-    }
 
     await db.batch([
       db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(targetId),
@@ -556,6 +605,13 @@ export default {
     const url = new URL(request.url);
 
     try {
+      if (url.pathname.startsWith("/signal/")) {
+        if (!env.CALL_ROOMS) return new Response("CALL_ROOMS binding is missing", { status: 503 });
+        const room = url.pathname.slice("/signal/".length).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+        if (!room) return new Response("Room ID required", { status: 400 });
+        const id = env.CALL_ROOMS.idFromName(room);
+        return env.CALL_ROOMS.get(id).fetch(request);
+      }
       if (url.pathname.startsWith("/api/")) {
         return await handleAPI(request, env);
       }
@@ -576,3 +632,28 @@ export default {
     }
   },
 };
+
+// WebRTC signaling relay. Media is sent peer-to-peer; this Durable Object relays only setup messages.
+export class CallRoom {
+  constructor(state, env) { this.state = state; this.env = env; this.clients = new Set(); }
+  async fetch(request) {
+    if (request.headers.get("Upgrade") !== "websocket") return new Response("WebSocket required", { status: 426 });
+    const pair = new WebSocketPair();
+    const client = pair[0], server = pair[1];
+    server.accept();
+    this.clients.add(server);
+    server.send(JSON.stringify({ type: "members", count: this.clients.size }));
+    server.addEventListener("message", event => {
+      let payload;
+      try { payload = JSON.parse(event.data); } catch { return; }
+      if (!payload || typeof payload !== "object") return;
+      const safe = JSON.stringify(payload);
+      for (const peer of this.clients) {
+        if (peer !== server) { try { peer.send(safe); } catch {} }
+      }
+    });
+    const close = () => { this.clients.delete(server); for (const peer of this.clients) { try { peer.send(JSON.stringify({ type: "peer-left" })); } catch {} } };
+    server.addEventListener("close", close); server.addEventListener("error", close);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+}
