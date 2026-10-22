@@ -1,0 +1,12 @@
+{
+  "name": "japan-connect",
+  "private": true,
+  "version": "1.1.0",
+  "scripts": {
+    "dev": "wrangler dev --config wrangler.toml",
+    "deploy": "wrangler deploy --config wrangler.toml"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
